@@ -103,6 +103,28 @@ PUT /api/rooms/:roomId/permissions/:userId   { "canControl": true|false }
 
 The WebSocket `joined` message includes the current account's `canControl` capability. `presence` includes deduplicated participant records (`id`, `username`, `isOwner`, `canControl`), and `permission_changed` broadcasts `{ roomId, userId, canControl }` after a successful change. Clients must treat these as UI updates only; HTTP and WebSocket authorization is always rechecked on the server.
 
+## Remote cursors and selections
+
+Rooms also use the official Yjs awareness protocol for temporary remote cursors and text selections. Monaco renders a coloured caret, translucent selection, and username label for each other browser tab in the same room. The colour is deterministic per authenticated account, so a user has the same colour in multiple tabs; each tab still has its own cursor because it has its own Yjs awareness client ID. The local cursor is never rendered as a remote cursor.
+
+Awareness is not persisted in PostgreSQL, added to `room_updates`, copied into `locked_code`, or sent to the execution queue. It remains available while the editor is locked because moving a cursor does not modify code or grant any room-control capability. Participant counts retain their existing meaning: they count WebSocket connections, while the participant drawer deduplicates accounts.
+
+No database migration is required for this feature.
+
+The custom authenticated WebSocket protocol adds these JSON messages after the normal `join`/`joined`/`yjs_sync` flow:
+
+```text
+Client -> server: awareness_register { clientId }
+Server -> client: awareness_registered { clientId, identity, activeClientIds, update }
+Client -> server: awareness_update { update }               # base64 awareness binary update
+Server -> clients: awareness_update { update }               # base64 awareness binary update
+Server -> client: awareness_rejected { reason, error }
+```
+
+The socket must already have joined a room. The server derives the target room from that socket, validates that every incoming frame has exactly one bounded awareness entry, and requires its client ID to match the ID registered by that socket. It replaces all client-supplied identity/colour fields with the authenticated account ID, username, and a server-chosen palette colour before relaying the update. A client-ID collision is rejected and the browser performs one clean room reopen to obtain a fresh Yjs document ID.
+
+On a socket close, room switch, logout, or deletion, the server removes that socket's state and broadcasts the official awareness removal. Reconnecting re-registers the existing room document ID and republishes its state with an incremented awareness clock, so a disconnect tombstone cannot hide the restored cursor. If the API restarts, awareness is intentionally cleared; reconnecting browsers publish it again. The awareness protocol also renews idle state approximately every 15 seconds and removes unseen remote state after the standard Yjs awareness timeout.
+
 ### Frontend, Nginx, and execution images
 
 ```bash

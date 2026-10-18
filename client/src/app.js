@@ -1,19 +1,27 @@
 import * as Y from "yjs";
 import { MonacoBinding } from "y-monaco";
 import {
+  Awareness,
+  applyAwarenessUpdate,
+  encodeAwarenessUpdate,
+  removeAwarenessStates,
+} from "y-protocols/awareness";
+import {
   createApi,
   getOwnedRooms,
   getRoomPermissions,
   setRoomControl,
 } from "./api.js";
 import { base64ToBytes, bytesToBase64, UUID_RE, setText } from "./utils.js";
-import { createEditor } from "./monaco-editor.js";
+import { createEditor, monaco } from "./monaco-editor.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
 const live = document.querySelector("#live-status");
 const SERVER_ORIGIN = Symbol("server-update");
-const state = { currentUser: null, currentScreen: "loading", currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, ws: null, intentionalSocketClose: false, reconnectAttempt: 0, reconnectTimer: null, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, executionJobId: null, executionStatus: "", generation: 0, dashboardGeneration: 0, lockPending: false, runPending: false };
+const SERVER_AWARENESS_ORIGIN = Symbol("server-awareness-update");
+const AWARENESS_COLOURS = new Set(["#58a6ff", "#d2a8ff", "#3fb950", "#f778ba", "#f2cc60", "#79c0ff", "#ff967d", "#56d4dd"]);
+const state = { currentUser: null, currentScreen: "loading", currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, ws: null, intentionalSocketClose: false, reconnectAttempt: 0, reconnectTimer: null, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, awareness: null, awarenessUpdateListener: null, awarenessChangeListener: null, awarenessRegistered: false, awarenessIdentity: null, awarenessStyle: null, remoteCursorWidgets: new Map(), awarenessCollisionRetries: 0, executionJobId: null, executionStatus: "", generation: 0, dashboardGeneration: 0, lockPending: false, runPending: false };
 let api;
 
 const el = (tag, attrs = {}, ...children) => {
@@ -139,13 +147,126 @@ function startRoom(room) {
   const output = el("section", { class: "output-panel" }, el("div", { class: "output-head" }, el("div", {}, el("h2", { text: "Execution output" }), job), el("button", { class: "button ghost", type: "button", onClick: () => { stdout.textContent = ""; stderr.textContent = ""; outputState.textContent = "Output cleared."; job.textContent = ""; } }, "Clear output")), outputState, el("h3", { text: "Standard output" }), stdout, el("h3", { text: "Standard error" }), stderr);
   const body = el("main", { class: "room" }, header, el("div", { class: "editor-shell" }, editorHost), output, drawer, el("p", { class: "feedback", "data-feedback": "", "aria-live": "polite" })); app.append(topbar({ room: true }), body);
   state.ui = { status, lock, participants, role, participantButton, drawer, drawerClose, lockButton, runButton, deleteButton, controlNote, participantList, permissionStatus, offlineSection, offlineGrants, outputState, job, stdout, stderr };
-  const { editor, model } = createEditor(editorHost, room.id, room.language); state.editor = editor; state.model = model; state.yDoc = new Y.Doc(); state.yText = state.yDoc.getText("code"); state.binding = new MonacoBinding(state.yText, model, new Set([editor]));
-  state.yListener = (update, origin) => { if (origin === SERVER_ORIGIN || !state.ws || state.ws.readyState !== WebSocket.OPEN || !state.joined || !state.initialSyncReceived || state.locked) return; state.ws.send(JSON.stringify({ type: "yjs_update", update: bytesToBase64(update) })); status.textContent = "Saving"; };
+  const { editor, model } = createEditor(editorHost, room.id, room.language); state.editor = editor; state.model = model; state.yDoc = new Y.Doc(); state.yText = state.yDoc.getText("code"); initializeAwareness();
+  state.yListener = (update, origin) => { renderRemoteAwareness(); if (origin === SERVER_ORIGIN || !state.ws || state.ws.readyState !== WebSocket.OPEN || !state.joined || !state.initialSyncReceived || state.locked) return; state.ws.send(JSON.stringify({ type: "yjs_update", update: bytesToBase64(update) })); status.textContent = "Saving"; };
   state.yDoc.on("update", state.yListener); participantButton.addEventListener("click", () => setParticipantsDrawer(!state.drawerOpen)); drawerClose.addEventListener("click", () => setParticipantsDrawer(false)); lockButton.addEventListener("click", () => sendLock(!state.locked)); runButton.addEventListener("click", runCode); deleteButton.addEventListener("click", deleteRoom);
   updateRoomUi(); connectSocket(generation);
 }
 
 function setParticipantsDrawer(open) { if (!state.ui) return; state.drawerOpen = Boolean(open); state.ui.drawer.hidden = !state.drawerOpen; state.ui.participantButton.setAttribute("aria-expanded", String(state.drawerOpen)); if (state.drawerOpen) state.ui.drawerClose.focus(); }
+
+function selectionFromEditor() {
+  const selection = state.editor?.getSelection();
+  if (!selection || !state.model || !state.yText) return null;
+  let anchor = state.model.getOffsetAt(selection.getStartPosition());
+  let head = state.model.getOffsetAt(selection.getEndPosition());
+  if (selection.getDirection() === monaco.SelectionDirection.RTL) [anchor, head] = [head, anchor];
+  return {
+    anchor: Y.createRelativePositionFromTypeIndex(state.yText, anchor),
+    head: Y.createRelativePositionFromTypeIndex(state.yText, head),
+  };
+}
+
+function validAwarenessIdentity(identity) {
+  return identity && typeof identity.id === "string" && typeof identity.name === "string" && identity.name.length <= 32 && AWARENESS_COLOURS.has(identity.color);
+}
+
+function awarenessColourAlpha(colour) {
+  const value = Number.parseInt(colour.slice(1), 16);
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, 0.26)`;
+}
+
+function initializeAwareness() {
+  state.awareness = new Awareness(state.yDoc);
+  state.awarenessStyle = document.createElement("style");
+  state.awarenessStyle.dataset.ccdAwareness = "";
+  document.head.append(state.awarenessStyle);
+  state.remoteCursorWidgets = new Map();
+  state.awarenessUpdateListener = ({ added, updated, removed }, origin) => {
+    if (origin !== "local" || !state.awarenessRegistered || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const clientIds = [...added, ...updated, ...removed];
+    if (clientIds.length !== 1 || clientIds[0] !== state.yDoc?.clientID) return;
+    state.ws.send(JSON.stringify({
+      type: "awareness_update",
+      update: bytesToBase64(encodeAwarenessUpdate(state.awareness, clientIds)),
+    }));
+  };
+  state.awarenessChangeListener = () => renderRemoteAwareness();
+  state.awareness.on("update", state.awarenessUpdateListener);
+  state.awareness.on("change", state.awarenessChangeListener);
+  state.binding = new MonacoBinding(state.yText, state.model, new Set([state.editor]), state.awareness);
+}
+
+function removeRemoteCursorWidgets() {
+  for (const widget of state.remoteCursorWidgets?.values() || []) {
+    state.editor?.removeContentWidget(widget);
+  }
+  state.remoteCursorWidgets?.clear();
+}
+
+function renderRemoteAwareness() {
+  if (!state.awareness || !state.editor || !state.model || !state.yDoc) return;
+  const active = new Set();
+  const css = [];
+
+  for (const [clientId, remoteState] of state.awareness.getStates()) {
+    if (clientId === state.yDoc.clientID || !Number.isSafeInteger(clientId)) continue;
+    const user = remoteState?.user;
+    const selection = remoteState?.selection;
+    if (!validAwarenessIdentity(user) || !selection?.head) continue;
+
+    let absolute;
+    try { absolute = Y.createAbsolutePositionFromRelativePosition(selection.head, state.yDoc); } catch { continue; }
+    if (!absolute || absolute.type !== state.yText) continue;
+    const position = state.model.getPositionAt(absolute.index);
+    active.add(clientId);
+    css.push(`.yRemoteSelection-${clientId}{background:${awarenessColourAlpha(user.color)}!important}.yRemoteSelectionHead-${clientId}::after,.yRemoteSelectionHead-${clientId}::before{border-color:${user.color}!important}`);
+
+    let widget = state.remoteCursorWidgets.get(clientId);
+    if (!widget) {
+      const node = document.createElement("div");
+      node.className = "remote-cursor-label";
+      node.setAttribute("aria-hidden", "true");
+      node.style.backgroundColor = user.color;
+      node.textContent = user.name;
+      widget = {
+        getId: () => `ccd-remote-cursor-${clientId}`,
+        getDomNode: () => node,
+        getPosition: () => ({ position: widget.position, preference: [monaco.editor.ContentWidgetPositionPreference.ABOVE] }),
+        position,
+      };
+      state.remoteCursorWidgets.set(clientId, widget);
+      state.editor.addContentWidget(widget);
+    } else {
+      widget.position = position;
+      widget.getDomNode().style.backgroundColor = user.color;
+      widget.getDomNode().textContent = user.name;
+    }
+    state.editor.layoutContentWidget(widget);
+  }
+
+  for (const [clientId, widget] of state.remoteCursorWidgets) {
+    if (!active.has(clientId)) {
+      state.editor.removeContentWidget(widget);
+      state.remoteCursorWidgets.delete(clientId);
+    }
+  }
+  if (state.awarenessStyle) state.awarenessStyle.textContent = css.join("\n");
+}
+
+function registerAwareness() {
+  if (!state.initialSyncReceived || !state.joined || state.awarenessRegistered || !state.yDoc || state.ws?.readyState !== WebSocket.OPEN) return;
+  state.ws.send(JSON.stringify({ type: "awareness_register", clientId: state.yDoc.clientID }));
+}
+
+function republishAwareness() {
+  if (!state.awareness || !validAwarenessIdentity(state.awarenessIdentity)) return;
+  state.awareness.setLocalState({
+    ...state.awareness.getLocalState(),
+    user: state.awarenessIdentity,
+    selection: selectionFromEditor(),
+  });
+}
 
 function updateRoomUi() { if (!state.ui) return; const { status, lock, participants, role, lockButton, runButton, deleteButton, controlNote } = state.ui; status.textContent = state.initialSyncReceived && state.ws?.readyState === WebSocket.OPEN ? "Saved" : state.ws?.readyState === WebSocket.OPEN ? "Syncing" : state.reconnectAttempt ? "Reconnecting" : "Connecting"; lock.textContent = state.locked ? "Locked" : "Unlocked"; lock.dataset.locked = String(state.locked); participants.textContent = `${state.participantCount} connection${state.participantCount === 1 ? "" : "s"}`; role.textContent = state.isOwner ? "Owner" : state.canControl ? "Controller" : "Participant"; controlNote.textContent = state.isOwner ? "You can manage control grants, locking, and execution." : state.canControl ? "The owner has allowed you to lock, unlock, and run the locked code." : "The owner can allow you to control locking and execution."; lockButton.hidden = !state.canControl; runButton.hidden = !state.canControl; deleteButton.hidden = !state.isOwner; lockButton.textContent = state.locked ? "Unlock" : "Lock"; lockButton.disabled = !state.joined || state.lockPending; runButton.disabled = !state.canControl || !state.locked || !state.initialSyncReceived || state.runPending; const editable = Boolean(state.ws?.readyState === WebSocket.OPEN && state.joined && state.initialSyncReceived && !state.locked); state.editor?.updateOptions({ readOnly: !editable, domReadOnly: !editable }); renderParticipants(); }
 
@@ -220,9 +341,9 @@ async function changeRoomPermission(participant, canControl, button) {
   } finally { if (generation === state.generation) button.disabled = false; }
 }
 
-function connectSocket(generation) { if (generation !== state.generation || state.ws) return; state.intentionalSocketClose = false; const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:"; const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws`); state.ws = socket; updateRoomUi(); socket.addEventListener("open", () => { if (generation !== state.generation || socket !== state.ws) return; socket.send(JSON.stringify({ type: "join", roomId: state.currentRoom.id })); }); socket.addEventListener("message", (event) => { if (generation === state.generation && socket === state.ws) handleSocketMessage(event.data); }); socket.addEventListener("close", (event) => { if (generation !== state.generation || socket !== state.ws) return; state.ws = null; state.joined = false; state.initialSyncReceived = false; updateRoomUi(); if (!state.intentionalSocketClose && event.code === 1008) { sessionExpired(); return; } if (!state.intentionalSocketClose) scheduleReconnect(generation); }); socket.addEventListener("error", () => {}); }
+function connectSocket(generation) { if (generation !== state.generation || state.ws) return; state.intentionalSocketClose = false; const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:"; const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws`); state.ws = socket; updateRoomUi(); socket.addEventListener("open", () => { if (generation !== state.generation || socket !== state.ws) return; socket.send(JSON.stringify({ type: "join", roomId: state.currentRoom.id })); }); socket.addEventListener("message", (event) => { if (generation === state.generation && socket === state.ws) handleSocketMessage(event.data); }); socket.addEventListener("close", (event) => { if (generation !== state.generation || socket !== state.ws) return; state.ws = null; state.joined = false; state.initialSyncReceived = false; state.awarenessRegistered = false; updateRoomUi(); if (!state.intentionalSocketClose && event.code === 1008) { sessionExpired(); return; } if (!state.intentionalSocketClose) scheduleReconnect(generation); }); socket.addEventListener("error", () => {}); }
 
-function handleSocketMessage(raw) { let message; try { message = JSON.parse(raw); } catch { feedback("Received an invalid server message.", "error"); return; } switch (message.type) { case "joined": state.currentRoom = message.room; state.isOwner = Boolean(message.isOwner); state.canControl = state.isOwner || Boolean(message.canControl); state.locked = Boolean(message.room.locked); state.participantCount = Number(message.participantCount) || 0; state.participants = Array.isArray(message.participants) ? message.participants : []; state.joined = true; state.lockPending = false; updateRoomUi(); if (state.isOwner) loadRoomPermissions(state.generation); break; case "yjs_sync": try { Y.applyUpdate(state.yDoc, base64ToBytes(message.update), SERVER_ORIGIN); state.initialSyncReceived = true; state.reconnectAttempt = 0; updateRoomUi(); } catch { feedback("Could not synchronize room content.", "error"); } break; case "yjs_update": try { Y.applyUpdate(state.yDoc, base64ToBytes(message.update), SERVER_ORIGIN); } catch { feedback("Could not apply a shared edit.", "error"); } break; case "yjs_saved": if (state.ui) state.ui.status.textContent = "Saved"; break; case "presence": state.participantCount = Number(message.participantCount) || 0; state.participants = Array.isArray(message.participants) ? message.participants : state.participants; updateRoomUi(); break; case "permission_changed": if (message.roomId !== state.currentRoom?.id) break; if (message.userId === state.currentUser?.id) { state.canControl = state.isOwner || Boolean(message.canControl); updateRoomUi(); } if (state.isOwner) loadRoomPermissions(state.generation); break; case "lock_state": state.locked = Boolean(message.locked); state.lockPending = false; updateRoomUi(); break; case "edit_rejected": state.locked = true; updateRoomUi(); feedback(message.error || "Room is locked.", "error"); break; case "execution_running": showExecution("Running", message.jobId); break; case "execution_completed": showResult(message.jobId, message.result); break; case "execution_failed": state.runPending = false; showExecution(`Execution failed: ${message.error || "Unknown worker error"}`, message.jobId, true); updateRoomUi(); break; case "room_deleted": cleanupRoom(); setRoomUrl(null); renderDashboard("This room was deleted."); break; case "error": state.lockPending = false; if (/authorized controller|room owner/i.test(message.error || "")) state.canControl = state.isOwner; updateRoomUi(); feedback(message.error || "Server error", "error"); if (message.error === "Session expired") sessionExpired(); break; default: feedback("Received an unknown server message.", "error"); } }
+function handleSocketMessage(raw) { let message; try { message = JSON.parse(raw); } catch { feedback("Received an invalid server message.", "error"); return; } switch (message.type) { case "joined": state.currentRoom = message.room; state.isOwner = Boolean(message.isOwner); state.canControl = state.isOwner || Boolean(message.canControl); state.locked = Boolean(message.room.locked); state.participantCount = Number(message.participantCount) || 0; state.participants = Array.isArray(message.participants) ? message.participants : []; state.joined = true; state.lockPending = false; updateRoomUi(); if (state.isOwner) loadRoomPermissions(state.generation); break; case "yjs_sync": try { Y.applyUpdate(state.yDoc, base64ToBytes(message.update), SERVER_ORIGIN); state.initialSyncReceived = true; state.reconnectAttempt = 0; updateRoomUi(); registerAwareness(); } catch { feedback("Could not synchronize room content.", "error"); } break; case "yjs_update": try { Y.applyUpdate(state.yDoc, base64ToBytes(message.update), SERVER_ORIGIN); } catch { feedback("Could not apply a shared edit.", "error"); } break; case "awareness_registered": if (message.clientId !== state.yDoc?.clientID || !validAwarenessIdentity(message.identity)) { feedback("Could not register remote cursor awareness.", "error"); break; } try { const active = new Set((Array.isArray(message.activeClientIds) ? message.activeClientIds : []).filter((clientId) => Number.isSafeInteger(clientId))); const stale = [...state.awareness.getStates().keys()].filter((clientId) => clientId !== state.yDoc.clientID && !active.has(clientId)); removeAwarenessStates(state.awareness, stale, SERVER_AWARENESS_ORIGIN); if (typeof message.update === "string" && message.update.length) applyAwarenessUpdate(state.awareness, base64ToBytes(message.update), SERVER_AWARENESS_ORIGIN); state.awarenessIdentity = message.identity; state.awarenessRegistered = true; state.awarenessCollisionRetries = 0; republishAwareness(); renderRemoteAwareness(); } catch { feedback("Could not synchronize remote cursors.", "error"); } break; case "awareness_update": try { applyAwarenessUpdate(state.awareness, base64ToBytes(message.update), SERVER_AWARENESS_ORIGIN); } catch { feedback("Could not apply remote cursor state.", "error"); } break; case "awareness_rejected": if (message.reason === "client_id_collision" && state.awarenessCollisionRetries < 1 && state.currentRoom) { const roomId = state.currentRoom.id; state.awarenessCollisionRetries += 1; feedback("Refreshing the editor to recover a cursor identity collision.", "error"); setTimeout(() => openRoom(roomId, true), 0); } else { feedback(message.error || "Remote cursor update was rejected.", "error"); } break; case "yjs_saved": if (state.ui) state.ui.status.textContent = "Saved"; break; case "presence": state.participantCount = Number(message.participantCount) || 0; state.participants = Array.isArray(message.participants) ? message.participants : state.participants; updateRoomUi(); break; case "permission_changed": if (message.roomId !== state.currentRoom?.id) break; if (message.userId === state.currentUser?.id) { state.canControl = state.isOwner || Boolean(message.canControl); updateRoomUi(); } if (state.isOwner) loadRoomPermissions(state.generation); break; case "lock_state": state.locked = Boolean(message.locked); state.lockPending = false; updateRoomUi(); break; case "edit_rejected": state.locked = true; updateRoomUi(); feedback(message.error || "Room is locked.", "error"); break; case "execution_running": showExecution("Running", message.jobId); break; case "execution_completed": showResult(message.jobId, message.result); break; case "execution_failed": state.runPending = false; showExecution(`Execution failed: ${message.error || "Unknown worker error"}`, message.jobId, true); updateRoomUi(); break; case "room_deleted": cleanupRoom(); setRoomUrl(null); renderDashboard("This room was deleted."); break; case "error": state.lockPending = false; if (/authorized controller|room owner/i.test(message.error || "")) state.canControl = state.isOwner; updateRoomUi(); feedback(message.error || "Server error", "error"); if (message.error === "Session expired") sessionExpired(); break; default: feedback("Received an unknown server message.", "error"); } }
 
 function scheduleReconnect(generation) { if (state.reconnectAttempt >= 5) { if (state.ui) { state.ui.status.textContent = "Disconnected"; const retry = el("button", { class: "button ghost retry", type: "button", text: "Retry", onClick: () => { retry.remove(); state.reconnectAttempt = 0; connectSocket(generation); } }); state.ui.status.after(retry); } return; } const delays = [500, 1000, 2000, 4000, 8000]; const delay = delays[state.reconnectAttempt++]; updateRoomUi(); state.reconnectTimer = setTimeout(() => { state.reconnectTimer = null; connectSocket(generation); }, delay); }
 function sendLock(locked) { if (!state.canControl || !state.joined || state.ws?.readyState !== WebSocket.OPEN) return; state.lockPending = true; updateRoomUi(); state.ws.send(JSON.stringify({ type: "set_lock", locked })); }
@@ -230,7 +351,7 @@ async function runCode() { if (!state.canControl || !state.locked || state.runPe
 function showExecution(status, jobId, failure = false) { const nextJobId = jobId == null ? null : String(jobId); if (status === "Queued" && nextJobId === state.executionJobId && state.executionStatus && state.executionStatus !== "Queued") return; state.executionJobId = nextJobId; state.executionStatus = status; if (!state.ui) return; state.ui.outputState.textContent = status; state.ui.outputState.dataset.type = failure ? "error" : ""; state.ui.job.textContent = nextJobId == null ? "" : `Job ${nextJobId}`; }
 function showResult(jobId, result = {}) { if (!state.ui) return; const exitCode = Number(result.exitCode); state.executionJobId = String(jobId); state.executionStatus = exitCode === 0 ? "Completed" : "Failed"; state.ui.stdout.textContent = result.stdout || ""; state.ui.stderr.textContent = result.stderr || ""; state.ui.outputState.textContent = exitCode === 0 ? "Completed successfully." : `Exited with code ${Number.isFinite(exitCode) ? exitCode : "unknown"}`; state.ui.outputState.dataset.type = exitCode === 0 ? "success" : "error"; state.ui.job.textContent = `Job ${jobId}`; state.runPending = false; updateRoomUi(); }
 async function deleteRoom() { if (!state.isOwner || !state.currentRoom || !window.confirm("Delete this room permanently? This cannot be undone.")) return; try { await api(`/api/rooms/${encodeURIComponent(state.currentRoom.id)}`, { method: "DELETE" }); cleanupRoom(); setRoomUrl(null); renderDashboard("Room deleted."); } catch (e) { feedback(e.message, "error"); } }
-function cleanupRoom() { state.generation += 1; state.intentionalSocketClose = true; if (state.reconnectTimer) clearTimeout(state.reconnectTimer); state.reconnectTimer = null; if (state.ws) { try { state.ws.close(); } catch {} } state.ws = null; if (state.yDoc && state.yListener) state.yDoc.off("update", state.yListener); state.binding?.destroy(); state.editor?.dispose(); state.model?.dispose(); state.yDoc?.destroy(); Object.assign(state, { currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, executionJobId: null, executionStatus: "", lockPending: false, runPending: false, ui: null }); }
+function cleanupRoom() { state.generation += 1; state.intentionalSocketClose = true; state.awarenessRegistered = false; if (state.reconnectTimer) clearTimeout(state.reconnectTimer); state.reconnectTimer = null; if (state.ws) { try { state.ws.close(); } catch {} } state.ws = null; if (state.yDoc && state.yListener) state.yDoc.off("update", state.yListener); if (state.awareness && state.awarenessUpdateListener) state.awareness.off("update", state.awarenessUpdateListener); if (state.awareness && state.awarenessChangeListener) state.awareness.off("change", state.awarenessChangeListener); removeRemoteCursorWidgets(); state.awarenessStyle?.remove(); state.binding?.destroy(); state.awareness?.destroy(); state.editor?.dispose(); state.model?.dispose(); state.yDoc?.destroy(); Object.assign(state, { currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, awareness: null, awarenessUpdateListener: null, awarenessChangeListener: null, awarenessIdentity: null, awarenessStyle: null, remoteCursorWidgets: new Map(), executionJobId: null, executionStatus: "", lockPending: false, runPending: false, ui: null }); }
 async function logout() { try { await api("/api/auth/logout", { method: "POST" }); } catch (e) { feedback(e.message, "error"); return; } cleanupRoom(); state.currentUser = null; setRoomUrl(null); renderAuth("You have been logged out."); }
 function sessionExpired() { if (!state.currentUser) return; cleanupRoom(); state.currentUser = null; setRoomUrl(null); renderAuth("Your session expired. Please log in again."); }
 window.addEventListener("popstate", () => { const room = roomIdFromUrl(); if (state.currentUser && room && room !== state.currentRoom?.id) openRoom(room, true); else if (state.currentUser && !room && state.currentScreen === "room") renderDashboard(); });
