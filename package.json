@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test test/*.test.mjs",
+    "test:permissions": "node --test test/room-permissions.test.mjs",
     "build:client": "node scripts/build-client.mjs",
     "watch:client": "node scripts/build-client.mjs --watch"
   },

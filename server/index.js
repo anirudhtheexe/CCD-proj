@@ -12,6 +12,11 @@ import {
   executionQueue,
   executionQueueEvents,
 } from "./queue.js";
+import {
+  isUserConnected,
+  isValidUuid,
+  userCanControl,
+} from "./room-permissions.js";
 
 const PORT = 3000;
 
@@ -332,6 +337,10 @@ app.get(
 );
 
 app.post("/api/rooms/:roomId/run", requireAuth, async (req, res) => {
+  if (!isValidUuid(req.params.roomId)) {
+    return res.status(400).json({ error: "Invalid room ID" });
+  }
+
   try {
     const result = await db.query(
       `SELECT id, language, locked, locked_code, owner_id
@@ -346,9 +355,9 @@ app.post("/api/rooms/:roomId/run", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Room not found" });
     }
 
-    if (room.owner_id !== req.session.userId) {
+    if (!(await userCanControl(db, room, req.session.userId))) {
       return res.status(403).json({
-        error: "Only the room owner can run code",
+        error: "Only the room owner or an authorized controller can run code",
       });
     }
 
@@ -380,6 +389,156 @@ app.post("/api/rooms/:roomId/run", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Could not queue execution" });
   }
 });
+
+app.get(
+  "/api/rooms/:roomId/permissions",
+  requireAuth,
+  async (req, res) => {
+    const roomId = req.params.roomId;
+
+    if (!isValidUuid(roomId)) {
+      return res.status(400).json({ error: "Invalid room ID" });
+    }
+
+    try {
+      const roomResult = await db.query(
+        `SELECT id, owner_id
+         FROM rooms
+         WHERE id = $1`,
+        [roomId]
+      );
+      const room = roomResult.rows[0];
+
+      if (!room) {
+        return res.status(404).json({ error: "Room not found" });
+      }
+
+      if (room.owner_id !== req.session.userId) {
+        return res.status(403).json({
+          error: "Only the room owner can manage permissions",
+        });
+      }
+
+      const result = await db.query(
+        `SELECT permission.user_id, users.username, permission.created_at
+         FROM room_permissions AS permission
+         JOIN users ON users.id = permission.user_id
+         WHERE permission.room_id = $1
+         ORDER BY users.username ASC`,
+        [roomId]
+      );
+
+      res.json({
+        permissions: result.rows.map((permission) => ({
+          userId: permission.user_id,
+          username: permission.username,
+          canControl: true,
+          connected: isUserConnected(
+            roomConnections,
+            roomId,
+            permission.user_id
+          ),
+          createdAt: permission.created_at,
+        })),
+      });
+    } catch (error) {
+      console.error("Could not load room permissions:", error);
+      res.status(500).json({ error: "Could not load room permissions" });
+    }
+  }
+);
+
+app.put(
+  "/api/rooms/:roomId/permissions/:userId",
+  requireAuth,
+  async (req, res) => {
+    const { roomId, userId } = req.params;
+    const { canControl } = req.body || {};
+
+    if (!isValidUuid(roomId) || !isValidUuid(userId)) {
+      return res.status(400).json({ error: "Invalid room or user ID" });
+    }
+
+    if (typeof canControl !== "boolean") {
+      return res.status(400).json({
+        error: "canControl must be true or false",
+      });
+    }
+
+    try {
+      const roomResult = await db.query(
+        `SELECT id, owner_id
+         FROM rooms
+         WHERE id = $1`,
+        [roomId]
+      );
+      const room = roomResult.rows[0];
+
+      if (!room) {
+        return res.status(404).json({ error: "Room not found" });
+      }
+
+      if (room.owner_id !== req.session.userId) {
+        return res.status(403).json({
+          error: "Only the room owner can manage permissions",
+        });
+      }
+
+      if (room.owner_id === userId) {
+        return res.status(400).json({
+          error: "The owner always has control permission",
+        });
+      }
+
+      const userResult = await db.query(
+        `SELECT id
+         FROM users
+         WHERE id = $1`,
+        [userId]
+      );
+
+      if (!userResult.rows[0]) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      if (canControl && !isUserConnected(roomConnections, roomId, userId)) {
+        return res.status(409).json({
+          error: "A user must be connected to receive control permission",
+        });
+      }
+
+      if (canControl) {
+        await db.query(
+          `INSERT INTO room_permissions (room_id, user_id)
+           VALUES ($1, $2)
+           ON CONFLICT (room_id, user_id) DO NOTHING`,
+          [roomId, userId]
+        );
+      } else {
+        await db.query(
+          `DELETE FROM room_permissions
+           WHERE room_id = $1 AND user_id = $2`,
+          [roomId, userId]
+        );
+      }
+
+      broadcastToRoom(roomId, {
+        type: "permission_changed",
+        roomId,
+        userId,
+        canControl,
+      });
+      broadcastRoomPresence(roomId, room.owner_id).catch((error) => {
+        console.error("Could not broadcast room presence:", error);
+      });
+
+      res.json({ roomId, userId, canControl });
+    } catch (error) {
+      console.error("Could not change room permissions:", error);
+      res.status(500).json({ error: "Could not change room permissions" });
+    }
+  }
+);
 
 app.delete("/api/rooms/:roomId", requireAuth, async (req, res) => {
   const roomId = req.params.roomId;
@@ -476,6 +635,58 @@ function broadcastToRoom(roomId, message) {
   }
 }
 
+async function getRoomPresence(roomId, ownerId) {
+  const connections = roomConnections.get(roomId);
+  const participantCount = connections?.size ?? 0;
+  const userIds = [
+    ...new Set(
+      [...(connections || [])]
+        .map((connection) => connection.userId)
+        .filter(Boolean)
+    ),
+  ];
+
+  if (userIds.length === 0) {
+    return { participantCount, participants: [] };
+  }
+
+  const result = await db.query(
+    `SELECT users.id,
+            users.username,
+            (users.id = $2::uuid OR EXISTS (
+              SELECT 1
+              FROM room_permissions
+              WHERE room_id = $3 AND user_id = users.id
+            )) AS can_control
+     FROM users
+     WHERE users.id = ANY($1::uuid[])`,
+    [userIds, ownerId, roomId]
+  );
+  const byId = new Map(result.rows.map((user) => [user.id, user]));
+
+  return {
+    participantCount,
+    participants: userIds.flatMap((userId) => {
+      const user = byId.get(userId);
+      if (!user) return [];
+      return [{
+        id: user.id,
+        username: user.username,
+        isOwner: user.id === ownerId,
+        canControl: Boolean(user.can_control),
+      }];
+    }),
+  };
+}
+
+async function broadcastRoomPresence(roomId, ownerId) {
+  const presence = await getRoomPresence(roomId, ownerId);
+  broadcastToRoom(roomId, {
+    type: "presence",
+    ...presence,
+  });
+}
+
 executionQueueEvents.on("active", async ({ jobId }) => {
   try {
     const job = await executionQueue.getJob(jobId);
@@ -525,6 +736,7 @@ executionQueueEvents.on("failed", async ({ jobId, failedReason }) => {
 
 function leaveRoom(socket) {
   const roomId = socket.roomId;
+  const ownerId = socket.roomOwnerId;
 
   if (!roomId) {
     return;
@@ -533,6 +745,7 @@ function leaveRoom(socket) {
   const connections = roomConnections.get(roomId);
 
   socket.roomId = null;
+  socket.roomOwnerId = null;
 
   if (!connections) {
     return;
@@ -545,13 +758,12 @@ function leaveRoom(socket) {
     return;
   }
 
-  broadcastToRoom(roomId, {
-    type: "presence",
-    participantCount: connections.size,
+  broadcastRoomPresence(roomId, ownerId).catch((error) => {
+    console.error("Could not broadcast room presence:", error);
   });
 }
 
-function addToRoom(socket, roomId) {
+function addToRoom(socket, roomId, ownerId) {
   if (
     socket.roomId &&
     socket.roomId !== roomId
@@ -568,8 +780,9 @@ function addToRoom(socket, roomId) {
 
   connections.add(socket);
   socket.roomId = roomId;
+  socket.roomOwnerId = ownerId;
 
-  return connections.size;
+  return connections;
 }
 
 /*
@@ -726,6 +939,8 @@ wss.on("connection", (socket, request) => {
   console.log("WebSocket connected:", request.session.userId);
 
   socket.roomId = null;
+  socket.roomOwnerId = null;
+  socket.userId = request.session.userId;
 
   socket.on("message", (data, isBinary) => {
     request.session.reload(async (sessionError) => {
@@ -764,12 +979,7 @@ wss.on("connection", (socket, request) => {
        */
 
       if (message.type === "join") {
-        if (
-          typeof message.roomId !== "string" ||
-          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-            message.roomId
-          )
-        ) {
+        if (!isValidUuid(message.roomId)) {
           sendJson(socket, {
             type: "error",
             error: "Invalid room ID",
@@ -796,7 +1006,12 @@ wss.on("connection", (socket, request) => {
           }
 
           const document = await getRoomDocument(room);
-          const participantCount = addToRoom(socket, room.id);
+          socket.userId = request.session.userId;
+          addToRoom(socket, room.id, room.owner_id);
+          const [presence, canControl] = await Promise.all([
+            getRoomPresence(room.id, room.owner_id),
+            userCanControl(db, room, request.session.userId),
+          ]);
 
           sendJson(socket, {
             type: "joined",
@@ -808,7 +1023,8 @@ wss.on("connection", (socket, request) => {
               createdAt: room.created_at,
             },
             isOwner: room.owner_id === request.session.userId,
-            participantCount,
+            canControl,
+            ...presence,
           });
 
           sendJson(socket, {
@@ -820,7 +1036,7 @@ wss.on("connection", (socket, request) => {
 
           broadcastToRoom(room.id, {
             type: "presence",
-            participantCount,
+            ...presence,
           });
 
           console.log(
@@ -889,13 +1105,16 @@ wss.on("connection", (socket, request) => {
             return;
           }
 
-          if (room.owner_id !== request.session.userId) {
+          if (!(await userCanControl(client, {
+            id: socket.roomId,
+            owner_id: room.owner_id,
+          }, request.session.userId))) {
             await client.query("ROLLBACK");
             transactionStarted = false;
 
             sendJson(socket, {
               type: "error",
-              error: "Only the room owner can change the lock",
+              error: "Only the room owner or an authorized controller can change the lock",
             });
             return;
           }

@@ -39,3 +39,17 @@ export async function getOwnedRooms(api) {
   const response = await api("/api/rooms");
   return Array.isArray(response?.rooms) ? response.rooms : [];
 }
+
+export async function getRoomPermissions(api, roomId) {
+  const response = await api(
+    `/api/rooms/${encodeURIComponent(roomId)}/permissions`
+  );
+  return Array.isArray(response?.permissions) ? response.permissions : [];
+}
+
+export function setRoomControl(api, roomId, userId, canControl) {
+  return api(
+    `/api/rooms/${encodeURIComponent(roomId)}/permissions/${encodeURIComponent(userId)}`,
+    { method: "PUT", body: { canControl } }
+  );
+}

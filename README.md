@@ -45,7 +45,7 @@ sudo systemctl enable --now postgresql valkey docker nginx
 
 ### Database
 
-The backend connects through the PostgreSQL Unix socket `/run/postgresql`, to database `ccd_proj`, as the operating-system user in `process.env.USER`. It does not set a database password, host, or TCP port.
+By default, the backend connects through the PostgreSQL Unix socket `/run/postgresql`, to database `ccd_proj`, as the operating-system user in `process.env.USER`. It can instead use `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD`; when connecting to a TLS database such as RDS, set `DB_SSL_CA_PATH` to a trusted CA file so certificate verification remains enabled. Keep passwords and CA files out of Git.
 
 ```bash
 createdb ccd_proj
@@ -53,6 +53,12 @@ psql -d ccd_proj -f db/schema.sql
 ```
 
 If `ccd_proj` already exists, do not recreate it. Inspect `db/schema.sql` first; it uses `CREATE TABLE IF NOT EXISTS` where applicable and additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements.
+
+For an existing database deploying room-control permissions, apply the additive migration once before starting the updated API:
+
+```bash
+psql -v ON_ERROR_STOP=1 -d ccd_proj -f db/migrations/20261018_add_room_permissions.sql
+```
 
 ### Environment
 
@@ -77,8 +83,25 @@ Place the output in `.env` as one line. Keep it secret and uncommitted.
 | `REDIS_HOST` | No | Defaults to `127.0.0.1`. |
 | `REDIS_PORT` | No | Defaults to `6379`. |
 | `USER` | Host-provided | Used as the local PostgreSQL role. |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | No | Override the local PostgreSQL defaults. |
+| `DB_SSL_CA_PATH` | No | Trusted CA bundle for verified PostgreSQL TLS. |
 
 `NODE_ENV=production` sets the session cookie's `Secure` attribute. A secure cookie requires HTTPS, so authentication can appear broken if the application is still opened at plain `http://localhost:8080`. Do not set `NODE_ENV=production` for the current local HTTP setup. For a real production deployment, configure HTTPS first and then use `NODE_ENV=production`.
+
+## Room control permissions
+
+Each room has one owner. The owner always has implicit control and remains the only account that can delete the room or grant/revoke permissions. A non-owner can receive one persistent `canControl` grant for that room, which permits locking, unlocking, and queuing execution of the server-side locked snapshot. It does not transfer ownership or permit managing other users' grants.
+
+Grants are stored in `room_permissions` by room UUID and user UUID, survive reconnects/API restarts, and are deleted automatically if the room or user is deleted. A new grant requires the target account to be currently connected to that room; revocation works while the target is offline. The browser's participant count still counts WebSocket connections, while the visible participant list is deduplicated by user account.
+
+Owner-only HTTP endpoints:
+
+```text
+GET /api/rooms/:roomId/permissions
+PUT /api/rooms/:roomId/permissions/:userId   { "canControl": true|false }
+```
+
+The WebSocket `joined` message includes the current account's `canControl` capability. `presence` includes deduplicated participant records (`id`, `username`, `isOwner`, `canControl`), and `permission_changed` broadcasts `{ roomId, userId, canControl }` after a successful change. Clients must treat these as UI updates only; HTTP and WebSocket authorization is always rechecked on the server.
 
 ### Frontend, Nginx, and execution images
 
@@ -344,6 +367,7 @@ Inspect `db/schema.sql` before rerunning it on an existing installation. Useful 
 \d users
 \d rooms
 \d room_updates
+\d room_permissions
 SELECT current_user, current_database();
 ```
 
@@ -351,7 +375,7 @@ No destructive database-reset commands are included here.
 
 ## Queue and worker behavior
 
-Express queues owner-requested, locked-room executions in BullMQ. Valkey stores queue state; `server/worker.js` consumes the `code-execution` queue with concurrency 2; `server/executor.js` launches the Docker sandbox. The HTTP request returns after queueing, and execution progress/results reach room clients via WebSocket. Only the room owner can request execution and the editor must be locked.
+Express queues owner- or control-permission-requested, locked-room executions in BullMQ. Valkey stores queue state; `server/worker.js` consumes the `code-execution` queue with concurrency 2; `server/executor.js` launches the Docker sandbox. The HTTP request returns after queueing, and execution progress/results reach room clients via WebSocket. The editor must be locked before execution, and the worker receives the server-side locked snapshot rather than browser-supplied code.
 
 Restarting the worker does not delete PostgreSQL rooms or users. Queued jobs remain in Valkey for a restarted worker. An interrupted active job can be treated as stalled/failed by BullMQ; this application configures one attempt only. Completed jobs are retained for up to one hour (maximum 1,000); failed jobs for up to 24 hours (maximum 1,000).
 
