@@ -171,9 +171,9 @@ function validAwarenessIdentity(identity) {
   return identity && typeof identity.id === "string" && typeof identity.name === "string" && identity.name.length <= 32 && AWARENESS_COLOURS.has(identity.color);
 }
 
-function awarenessColourAlpha(colour) {
+function awarenessColourAlpha(colour, alpha) {
   const value = Number.parseInt(colour.slice(1), 16);
-  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, 0.07)`;
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
 }
 
 function initializeAwareness() {
@@ -220,7 +220,7 @@ function renderRemoteAwareness() {
     if (!absolute || absolute.type !== state.yText) continue;
     const position = state.model.getPositionAt(absolute.index);
     active.add(clientId);
-    css.push(`.yRemoteSelection-${clientId}{background:${awarenessColourAlpha(user.color)}!important}.yRemoteSelectionHead-${clientId}::after,.yRemoteSelectionHead-${clientId}::before{border-color:${user.color}!important}`);
+    css.push(`.yRemoteSelection-${clientId}{background:${awarenessColourAlpha(user.color, 0.04)}!important}.yRemoteSelectionHead-${clientId}::after,.yRemoteSelectionHead-${clientId}::before{border-color:${awarenessColourAlpha(user.color, 0.55)}!important}`);
 
     let widget = state.remoteCursorWidgets.get(clientId);
     if (!widget) {
