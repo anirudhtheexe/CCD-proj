@@ -21,7 +21,7 @@ const live = document.querySelector("#live-status");
 const SERVER_ORIGIN = Symbol("server-update");
 const SERVER_AWARENESS_ORIGIN = Symbol("server-awareness-update");
 const AWARENESS_COLOURS = new Set(["#58a6ff", "#d2a8ff", "#3fb950", "#f778ba", "#f2cc60", "#79c0ff", "#ff967d", "#56d4dd"]);
-const state = { currentUser: null, currentScreen: "loading", currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, ws: null, intentionalSocketClose: false, reconnectAttempt: 0, reconnectTimer: null, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, awareness: null, awarenessUpdateListener: null, awarenessChangeListener: null, awarenessRegistered: false, awarenessIdentity: null, awarenessStyle: null, remoteCursorWidgets: new Map(), awarenessCollisionRetries: 0, executionJobId: null, executionStatus: "", generation: 0, dashboardGeneration: 0, lockPending: false, runPending: false };
+const state = { currentUser: null, currentScreen: "loading", currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, ws: null, intentionalSocketClose: false, reconnectAttempt: 0, reconnectTimer: null, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, awareness: null, awarenessUpdateListener: null, awarenessChangeListener: null, awarenessRegistered: false, awarenessIdentity: null, awarenessStyle: null, remoteCursorWidgets: new Map(), remoteAwarenessVisible: true, remoteAwarenessHideTimer: null, awarenessCollisionRetries: 0, executionJobId: null, executionStatus: "", generation: 0, dashboardGeneration: 0, lockPending: false, runPending: false };
 let api;
 
 const el = (tag, attrs = {}, ...children) => {
@@ -191,7 +191,12 @@ function initializeAwareness() {
       update: bytesToBase64(encodeAwarenessUpdate(state.awareness, clientIds)),
     }));
   };
-  state.awarenessChangeListener = () => renderRemoteAwareness();
+  state.awarenessChangeListener = ({ added, updated }, origin) => {
+    const hasRemoteMovement = origin === SERVER_AWARENESS_ORIGIN && [...added, ...updated]
+      .some((clientId) => clientId !== state.yDoc?.clientID);
+    if (hasRemoteMovement) showRemoteAwareness();
+    else renderRemoteAwareness();
+  };
   state.awareness.on("update", state.awarenessUpdateListener);
   state.awareness.on("change", state.awarenessChangeListener);
   state.binding = new MonacoBinding(state.yText, state.model, new Set([state.editor]), state.awareness);
@@ -202,6 +207,17 @@ function removeRemoteCursorWidgets() {
     state.editor?.removeContentWidget(widget);
   }
   state.remoteCursorWidgets?.clear();
+}
+
+function showRemoteAwareness() {
+  state.remoteAwarenessVisible = true;
+  if (state.remoteAwarenessHideTimer) clearTimeout(state.remoteAwarenessHideTimer);
+  renderRemoteAwareness();
+  state.remoteAwarenessHideTimer = setTimeout(() => {
+    state.remoteAwarenessHideTimer = null;
+    state.remoteAwarenessVisible = false;
+    renderRemoteAwareness();
+  }, 3000);
 }
 
 function renderRemoteAwareness() {
@@ -219,6 +235,10 @@ function renderRemoteAwareness() {
     try { absolute = Y.createAbsolutePositionFromRelativePosition(selection.head, state.yDoc); } catch { continue; }
     if (!absolute || absolute.type !== state.yText) continue;
     const position = state.model.getPositionAt(absolute.index);
+    if (!state.remoteAwarenessVisible) {
+      css.push(`.yRemoteSelection-${clientId}{background:transparent!important}.yRemoteSelectionHead-${clientId}::after,.yRemoteSelectionHead-${clientId}::before{border-color:transparent!important}`);
+      continue;
+    }
     active.add(clientId);
     css.push(`.yRemoteSelection-${clientId}{background:${awarenessColourAlpha(user.color, 0.04)}!important}.yRemoteSelectionHead-${clientId}::after,.yRemoteSelectionHead-${clientId}::before{border-color:${awarenessColourAlpha(user.color, 0.55)}!important}`);
 
@@ -351,7 +371,7 @@ async function runCode() { if (!state.canControl || !state.locked || state.runPe
 function showExecution(status, jobId, failure = false) { const nextJobId = jobId == null ? null : String(jobId); if (status === "Queued" && nextJobId === state.executionJobId && state.executionStatus && state.executionStatus !== "Queued") return; state.executionJobId = nextJobId; state.executionStatus = status; if (!state.ui) return; state.ui.outputState.textContent = status; state.ui.outputState.dataset.type = failure ? "error" : ""; state.ui.job.textContent = nextJobId == null ? "" : `Job ${nextJobId}`; }
 function showResult(jobId, result = {}) { if (!state.ui) return; const exitCode = Number(result.exitCode); state.executionJobId = String(jobId); state.executionStatus = exitCode === 0 ? "Completed" : "Failed"; state.ui.stdout.textContent = result.stdout || ""; state.ui.stderr.textContent = result.stderr || ""; state.ui.outputState.textContent = exitCode === 0 ? "Completed successfully." : `Exited with code ${Number.isFinite(exitCode) ? exitCode : "unknown"}`; state.ui.outputState.dataset.type = exitCode === 0 ? "success" : "error"; state.ui.job.textContent = `Job ${jobId}`; state.runPending = false; updateRoomUi(); }
 async function deleteRoom() { if (!state.isOwner || !state.currentRoom || !window.confirm("Delete this room permanently? This cannot be undone.")) return; try { await api(`/api/rooms/${encodeURIComponent(state.currentRoom.id)}`, { method: "DELETE" }); cleanupRoom(); setRoomUrl(null); renderDashboard("Room deleted."); } catch (e) { feedback(e.message, "error"); } }
-function cleanupRoom() { state.generation += 1; state.intentionalSocketClose = true; state.awarenessRegistered = false; if (state.reconnectTimer) clearTimeout(state.reconnectTimer); state.reconnectTimer = null; if (state.ws) { try { state.ws.close(); } catch {} } state.ws = null; if (state.yDoc && state.yListener) state.yDoc.off("update", state.yListener); if (state.awareness && state.awarenessUpdateListener) state.awareness.off("update", state.awarenessUpdateListener); if (state.awareness && state.awarenessChangeListener) state.awareness.off("change", state.awarenessChangeListener); removeRemoteCursorWidgets(); state.awarenessStyle?.remove(); state.binding?.destroy(); state.awareness?.destroy(); state.editor?.dispose(); state.model?.dispose(); state.yDoc?.destroy(); Object.assign(state, { currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, awareness: null, awarenessUpdateListener: null, awarenessChangeListener: null, awarenessIdentity: null, awarenessStyle: null, remoteCursorWidgets: new Map(), executionJobId: null, executionStatus: "", lockPending: false, runPending: false, ui: null }); }
+function cleanupRoom() { state.generation += 1; state.intentionalSocketClose = true; state.awarenessRegistered = false; if (state.reconnectTimer) clearTimeout(state.reconnectTimer); state.reconnectTimer = null; if (state.remoteAwarenessHideTimer) clearTimeout(state.remoteAwarenessHideTimer); state.remoteAwarenessHideTimer = null; if (state.ws) { try { state.ws.close(); } catch {} } state.ws = null; if (state.yDoc && state.yListener) state.yDoc.off("update", state.yListener); if (state.awareness && state.awarenessUpdateListener) state.awareness.off("update", state.awarenessUpdateListener); if (state.awareness && state.awarenessChangeListener) state.awareness.off("change", state.awarenessChangeListener); removeRemoteCursorWidgets(); state.awarenessStyle?.remove(); state.binding?.destroy(); state.awareness?.destroy(); state.editor?.dispose(); state.model?.dispose(); state.yDoc?.destroy(); Object.assign(state, { currentRoom: null, isOwner: false, canControl: false, locked: false, participantCount: 0, participants: [], permissions: [], drawerOpen: false, joined: false, initialSyncReceived: false, yDoc: null, yText: null, editor: null, model: null, binding: null, yListener: null, awareness: null, awarenessUpdateListener: null, awarenessChangeListener: null, awarenessIdentity: null, awarenessStyle: null, remoteCursorWidgets: new Map(), remoteAwarenessVisible: true, remoteAwarenessHideTimer: null, executionJobId: null, executionStatus: "", lockPending: false, runPending: false, ui: null }); }
 async function logout() { try { await api("/api/auth/logout", { method: "POST" }); } catch (e) { feedback(e.message, "error"); return; } cleanupRoom(); state.currentUser = null; setRoomUrl(null); renderAuth("You have been logged out."); }
 function sessionExpired() { if (!state.currentUser) return; cleanupRoom(); state.currentUser = null; setRoomUrl(null); renderAuth("Your session expired. Please log in again."); }
 window.addEventListener("popstate", () => { const room = roomIdFromUrl(); if (state.currentUser && room && room !== state.currentRoom?.id) openRoom(room, true); else if (state.currentUser && !room && state.currentScreen === "room") renderDashboard(); });
