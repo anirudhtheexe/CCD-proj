@@ -9,6 +9,12 @@ import pg from "pg";
 import { WebSocket, WebSocketServer } from "ws";
 import * as Y from "yjs";
 import {
+  Awareness,
+  applyAwarenessUpdate,
+  encodeAwarenessUpdate,
+  removeAwarenessStates,
+} from "y-protocols/awareness";
+import {
   executionQueue,
   executionQueueEvents,
 } from "./queue.js";
@@ -17,6 +23,12 @@ import {
   isValidUuid,
   userCanControl,
 } from "./room-permissions.js";
+import {
+  MAX_AWARENESS_UPDATE_BYTES,
+  createAwarenessIdentity,
+  isValidAwarenessClientId,
+  normalizeAwarenessUpdate,
+} from "./room-awareness.js";
 
 const PORT = 3000;
 
@@ -585,6 +597,7 @@ app.delete("/api/rooms/:roomId", requireAuth, async (req, res) => {
       }
     }
 
+    destroyRoomAwareness(roomId);
     roomConnections.delete(roomId);
     roomDocuments.delete(roomId);
 
@@ -616,6 +629,7 @@ const wss = new WebSocketServer({
 
 const roomConnections = new Map();
 const roomDocuments = new Map();
+const roomAwareness = new Map();
 
 function sendJson(socket, message) {
   if (socket.readyState === WebSocket.OPEN) {
@@ -633,6 +647,86 @@ function broadcastToRoom(roomId, message) {
   for (const connection of connections) {
     sendJson(connection, message);
   }
+}
+
+function broadcastToRoomExcept(roomId, message, excludedSocket) {
+  const connections = roomConnections.get(roomId);
+
+  if (!connections) return;
+
+  for (const connection of connections) {
+    if (connection !== excludedSocket) {
+      sendJson(connection, message);
+    }
+  }
+}
+
+function getRoomAwareness(roomId) {
+  let context = roomAwareness.get(roomId);
+
+  if (context) return context;
+
+  const awarenessDocument = new Y.Doc();
+  const awareness = new Awareness(awarenessDocument);
+  // The server is only a state holder and must never appear as a participant.
+  awareness.setLocalState(null);
+  context = {
+    awareness,
+    awarenessDocument,
+    owners: new Map(),
+    listener: null,
+  };
+  context.listener = ({ added, updated, removed }, origin) => {
+    const clientIds = [...added, ...updated, ...removed];
+    if (clientIds.length === 0) return;
+
+    broadcastToRoomExcept(roomId, {
+      type: "awareness_update",
+      update: Buffer.from(
+        encodeAwarenessUpdate(awareness, clientIds)
+      ).toString("base64"),
+    }, origin?.awarenessSocket);
+  };
+  awareness.on("update", context.listener);
+  roomAwareness.set(roomId, context);
+  return context;
+}
+
+function destroyRoomAwareness(roomId) {
+  const context = roomAwareness.get(roomId);
+  if (!context) return;
+
+  roomAwareness.delete(roomId);
+  context.awareness.off("update", context.listener);
+  context.owners.clear();
+  context.awareness.destroy();
+  context.awarenessDocument.destroy();
+}
+
+function removeSocketAwareness(socket) {
+  const roomId = socket.awarenessRoomId;
+  const clientId = socket.awarenessClientId;
+  const context = roomId ? roomAwareness.get(roomId) : null;
+
+  socket.awarenessRoomId = null;
+  socket.awarenessClientId = null;
+  socket.awarenessIdentity = null;
+
+  if (!context || !isValidAwarenessClientId(clientId)) return;
+  if (context.owners.get(clientId) !== socket) return;
+
+  context.owners.delete(clientId);
+  removeAwarenessStates(context.awareness, [clientId], {
+    awarenessSocket: socket,
+  });
+}
+
+function sendAwarenessRejection(socket, reason, error) {
+  sendJson(socket, {
+    type: "awareness_rejected",
+    reason,
+    error,
+  });
 }
 
 async function getRoomPresence(roomId, ownerId) {
@@ -744,6 +838,8 @@ function leaveRoom(socket) {
 
   const connections = roomConnections.get(roomId);
 
+  removeSocketAwareness(socket);
+
   socket.roomId = null;
   socket.roomOwnerId = null;
 
@@ -755,6 +851,7 @@ function leaveRoom(socket) {
 
   if (connections.size === 0) {
     roomConnections.delete(roomId);
+    destroyRoomAwareness(roomId);
     return;
   }
 
@@ -941,6 +1038,10 @@ wss.on("connection", (socket, request) => {
   socket.roomId = null;
   socket.roomOwnerId = null;
   socket.userId = request.session.userId;
+  socket.username = null;
+  socket.awarenessRoomId = null;
+  socket.awarenessClientId = null;
+  socket.awarenessIdentity = null;
 
   socket.on("message", (data, isBinary) => {
     request.session.reload(async (sessionError) => {
@@ -1005,8 +1106,25 @@ wss.on("connection", (socket, request) => {
             return;
           }
 
+          const userResult = await db.query(
+            `SELECT username
+             FROM users
+             WHERE id = $1`,
+            [request.session.userId]
+          );
+
+          if (!userResult.rows[0]) {
+            sendJson(socket, {
+              type: "error",
+              error: "Session user no longer exists",
+            });
+            socket.close(1008, "Authentication required");
+            return;
+          }
+
           const document = await getRoomDocument(room);
           socket.userId = request.session.userId;
+          socket.username = userResult.rows[0].username;
           addToRoom(socket, room.id, room.owner_id);
           const [presence, canControl] = await Promise.all([
             getRoomPresence(room.id, room.owner_id),
@@ -1051,6 +1169,121 @@ wss.on("connection", (socket, request) => {
           });
         }
 
+        return;
+      }
+
+      /*
+       * Register and relay temporary Yjs awareness. The room is always derived
+       * from the socket; clients cannot route awareness to another room.
+       */
+
+      if (message.type === "awareness_register") {
+        if (!socket.roomId) {
+          sendAwarenessRejection(socket, "not_joined", "Join a room first");
+          return;
+        }
+
+        if (!isValidAwarenessClientId(message.clientId)) {
+          sendAwarenessRejection(socket, "invalid_client_id", "Invalid awareness client ID");
+          return;
+        }
+
+        const context = getRoomAwareness(socket.roomId);
+        const existingOwner = context.owners.get(message.clientId);
+
+        if (
+          message.clientId === context.awareness.clientID ||
+          (existingOwner && existingOwner !== socket)
+        ) {
+          sendAwarenessRejection(
+            socket,
+            "client_id_collision",
+            "Awareness client ID is already registered; rejoin to obtain a fresh ID"
+          );
+          return;
+        }
+
+        if (
+          socket.awarenessClientId &&
+          socket.awarenessClientId !== message.clientId
+        ) {
+          removeSocketAwareness(socket);
+        }
+
+        socket.awarenessRoomId = socket.roomId;
+        socket.awarenessClientId = message.clientId;
+        socket.awarenessIdentity = createAwarenessIdentity(
+          socket.userId,
+          socket.username
+        );
+        context.owners.set(message.clientId, socket);
+
+        const activeClientIds = [...context.awareness.getStates().keys()]
+          .filter((clientId) => clientId !== message.clientId);
+
+        sendJson(socket, {
+          type: "awareness_registered",
+          clientId: message.clientId,
+          identity: socket.awarenessIdentity,
+          activeClientIds,
+          update: Buffer.from(
+            encodeAwarenessUpdate(context.awareness, activeClientIds)
+          ).toString("base64"),
+        });
+        return;
+      }
+
+      if (message.type === "awareness_update") {
+        if (!socket.roomId || !isValidAwarenessClientId(socket.awarenessClientId)) {
+          sendAwarenessRejection(socket, "not_registered", "Register awareness after joining a room");
+          return;
+        }
+
+        if (
+          typeof message.update !== "string" ||
+          message.update.length === 0 ||
+          message.update.length > Math.ceil(MAX_AWARENESS_UPDATE_BYTES * 4 / 3) + 8
+        ) {
+          sendAwarenessRejection(socket, "invalid_update", "Invalid awareness update");
+          return;
+        }
+
+        try {
+          const encoded = Buffer.from(message.update, "base64");
+          if (
+            encoded.length === 0 ||
+            encoded.length > MAX_AWARENESS_UPDATE_BYTES ||
+            encoded.toString("base64") !== message.update
+          ) {
+            throw new Error("Invalid base64");
+          }
+
+          const context = roomAwareness.get(socket.roomId);
+          if (!context || context.owners.get(socket.awarenessClientId) !== socket) {
+            throw new Error("Awareness registration is no longer active");
+          }
+
+          const normalized = normalizeAwarenessUpdate(
+            new Uint8Array(encoded),
+            socket.awarenessIdentity
+          );
+
+          if (normalized.entry.clientId !== socket.awarenessClientId) {
+            throw new Error("A socket may update only its registered awareness ID");
+          }
+
+          applyAwarenessUpdate(
+            context.awareness,
+            normalized.update,
+            { awarenessSocket: socket }
+          );
+        } catch (error) {
+          sendAwarenessRejection(
+            socket,
+            "invalid_update",
+            error.message || "Invalid awareness update"
+          );
+        }
         return;
       }
 
