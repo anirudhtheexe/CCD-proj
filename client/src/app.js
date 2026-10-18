@@ -173,7 +173,7 @@ function validAwarenessIdentity(identity) {
 
 function awarenessColourAlpha(colour) {
   const value = Number.parseInt(colour.slice(1), 16);
-  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, 0.26)`;
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, 0.12)`;
 }
 
 function initializeAwareness() {
