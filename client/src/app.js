@@ -210,8 +210,7 @@ function removeRemoteCursorWidgets() {
 }
 
 function showRemoteAwareness() {
-  state.remoteAwarenessVisible = true;
-  if (state.remoteAwarenessHideTimer) clearTimeout(state.remoteAwarenessHideTimer);
+  if (!state.remoteAwarenessVisible || state.remoteAwarenessHideTimer) return;
   renderRemoteAwareness();
   state.remoteAwarenessHideTimer = setTimeout(() => {
     state.remoteAwarenessHideTimer = null;
