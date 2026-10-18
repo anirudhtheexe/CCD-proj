@@ -3,6 +3,7 @@ import session from "express-session";
 import connectPgSimple from "connect-pg-simple";
 import argon2 from "argon2";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import pg from "pg";
 import { WebSocket, WebSocketServer } from "ws";
@@ -23,11 +24,35 @@ if (!process.env.SESSION_SECRET) {
 
 const app = express();
 
-const db = new Pool({
+const databaseConfig = {
   host: "/run/postgresql",
   database: "ccd_proj",
   user: process.env.USER,
-});
+};
+
+if (process.env.DB_HOST) {
+  databaseConfig.host = process.env.DB_HOST;
+}
+if (process.env.DB_PORT) {
+  databaseConfig.port = Number(process.env.DB_PORT);
+}
+if (process.env.DB_NAME) {
+  databaseConfig.database = process.env.DB_NAME;
+}
+if (process.env.DB_USER) {
+  databaseConfig.user = process.env.DB_USER;
+}
+if (process.env.DB_PASSWORD !== undefined) {
+  databaseConfig.password = process.env.DB_PASSWORD;
+}
+if (process.env.DB_SSL_CA_PATH) {
+  databaseConfig.ssl = {
+    ca: readFileSync(process.env.DB_SSL_CA_PATH, "utf8"),
+    rejectUnauthorized: true,
+  };
+}
+
+const db = new Pool(databaseConfig);
 
 app.use(express.json());
 
