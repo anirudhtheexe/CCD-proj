@@ -173,7 +173,7 @@ function validAwarenessIdentity(identity) {
 
 function awarenessColourAlpha(colour) {
   const value = Number.parseInt(colour.slice(1), 16);
-  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, 0.12)`;
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, 0.07)`;
 }
 
 function initializeAwareness() {
@@ -227,7 +227,7 @@ function renderRemoteAwareness() {
       const node = document.createElement("div");
       node.className = "remote-cursor-label";
       node.setAttribute("aria-hidden", "true");
-      node.style.backgroundColor = user.color;
+      node.style.color = user.color;
       node.textContent = user.name;
       widget = {
         getId: () => `ccd-remote-cursor-${clientId}`,
@@ -239,7 +239,7 @@ function renderRemoteAwareness() {
       state.editor.addContentWidget(widget);
     } else {
       widget.position = position;
-      widget.getDomNode().style.backgroundColor = user.color;
+      widget.getDomNode().style.color = user.color;
       widget.getDomNode().textContent = user.name;
     }
     state.editor.layoutContentWidget(widget);
