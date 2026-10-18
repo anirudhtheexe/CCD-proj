@@ -30,7 +30,8 @@ const el = (tag, attrs = {}, ...children) => {
 const clear = () => app.replaceChildren();
 const announce = (message) => { live.textContent = message; };
 const feedback = (message, type = "info") => { const node = document.querySelector("[data-feedback]"); if (node) { node.textContent = message; node.dataset.type = type; } announce(message); };
-const copyToClipboard = async (value, label) => { try { await navigator.clipboard.writeText(value); feedback(`${label} copied.`); } catch { feedback(`Could not copy ${label.toLowerCase()}.`, "error"); } };
+const copyWithFallback = (value) => { const textarea = document.createElement("textarea"); textarea.value = value; textarea.setAttribute("readonly", ""); textarea.setAttribute("aria-hidden", "true"); textarea.style.cssText = "position:fixed;opacity:0;pointer-events:none"; document.body.append(textarea); textarea.select(); const copied = document.execCommand("copy"); textarea.remove(); return copied; };
+const copyToClipboard = async (value, label) => { try { if (navigator.clipboard?.writeText && window.isSecureContext) await navigator.clipboard.writeText(value); else if (!copyWithFallback(value)) throw new Error("Copy failed"); feedback(`${label} copied.`); } catch { feedback(`Could not copy ${label.toLowerCase()}.`, "error"); } };
 const validCredentials = (username, password) => /^[A-Za-z0-9_]{3,32}$/.test(username) && password.length >= 8 && password.length <= 128;
 
 api = createApi(() => sessionExpired());
